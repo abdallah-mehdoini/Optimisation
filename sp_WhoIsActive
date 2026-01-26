@@ -1,0 +1,16 @@
+--L’option @get_full_inner_text = 1 modifie le comportement par défaut en demandant à SQL Server de récupérer l’intégralité du texte SQL en cours d’exécution pour chaque session active.
+
+EXEC sp_WhoIsActive @get_full_inner_text = 1
+
+--pour récupérer les plans d’exécution
+EXEC sp_WhoIsActive @get_plans = 1
+
+--Trier par consommation CPU
+EXEC sp_WhoIsActive 
+    @sort_order = 'cpu',
+    @get_full_inner_text = 1;
+--Trier par sessions bloquantes
+EXEC sp_WhoIsActive @sort_order = 'blocking_session_id';
+
+--combiner plusieurs options utiles pour un diagnostic complet :
+EXEC sp_WhoIsActive @get_full_inner_text = 1, @get_plans = 1, @get_locks = 1, @sort_order = 'cpu';
