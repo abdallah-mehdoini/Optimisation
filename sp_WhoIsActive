@@ -17,3 +17,5 @@ EXEC sp_WhoIsActive @get_full_inner_text = 1, @get_plans = 1, @get_locks = 1, @s
 
 --Afficher les sessions “sleeping”
 EXEC sp_WhoIsActive @show_sleeping_spids = 1;
+--Filtrer sur un login
+EXEC sp_WhoIsActive @filter = 'sa', @filter_type = 'login';
