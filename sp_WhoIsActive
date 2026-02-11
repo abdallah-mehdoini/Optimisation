@@ -19,3 +19,12 @@ EXEC sp_WhoIsActive @get_full_inner_text = 1, @get_plans = 1, @get_locks = 1, @s
 EXEC sp_WhoIsActive @show_sleeping_spids = 1;
 --Filtrer sur un login
 EXEC sp_WhoIsActive @filter = 'sa', @filter_type = 'login';
+
+--Voir les memory grants
+EXEC sp_WhoIsActive @get_memory_info = 1;
+
+--Voir les blocages (blockers + blocked)
+EXEC sp_WhoIsActive @find_block_leaders = 1;
+
+--Voir les verrous (locks)
+EXEC sp_WhoIsActive @get_locks = 1;
