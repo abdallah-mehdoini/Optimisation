@@ -14,3 +14,6 @@ EXEC sp_WhoIsActive @sort_order = 'blocking_session_id';
 
 --combiner plusieurs options utiles pour un diagnostic complet :
 EXEC sp_WhoIsActive @get_full_inner_text = 1, @get_plans = 1, @get_locks = 1, @sort_order = 'cpu';
+
+--Afficher les sessions “sleeping”
+EXEC sp_WhoIsActive @show_sleeping_spids = 1;
