@@ -1,1 +1,46 @@
 https://learn.microsoft.com/fr-fr/sql/relational-databases/system-dynamic-management-views/sys-dm-db-tuning-recommendations-transact-sql?view=sql-server-ver17
+
+WITH cte_db_tuning_recommendations AS (
+    SELECT reason,
+           score,
+           query_id,
+           regressedPlanId,
+           recommendedPlanId,
+           JSON_VALUE(STATE, '$.currentValue') AS current_state,
+           JSON_VALUE(STATE, '$.reason') AS current_state_reason,
+           JSON_VALUE(details, '$.implementationDetails.script') AS script,
+           (regressedPlanExecutionCount + recommendedPlanExecutionCount)
+             * (regressedPlanCpuTimeAverage - recommendedPlanCpuTimeAverage) / 1000000 AS estimated_gain,
+           IIF (regressedPlanErrorCount > recommendedPlanErrorCount, 'YES', 'NO') AS error_prone
+    FROM sys.dm_db_tuning_recommendations
+    CROSS APPLY OPENJSON (details, '$.planForceDetails') WITH (
+        [query_id] BIGINT '$.queryId',
+        regressedPlanId BIGINT '$.regressedPlanId',
+        recommendedPlanId BIGINT '$.recommendedPlanId',
+        regressedPlanErrorCount INT,
+        recommendedPlanErrorCount INT,
+        regressedPlanExecutionCount INT,
+        regressedPlanCpuTimeAverage FLOAT,
+        recommendedPlanExecutionCount INT,
+        recommendedPlanCpuTimeAverage FLOAT
+    )
+)
+SELECT qsq.query_id,
+       qsqt.query_sql_text,
+       dtr.*,
+       CAST(rp.query_plan AS XML) AS RegressedPlan,
+       CAST(sp.query_plan AS XML) AS SuggestedPlan
+FROM cte_db_tuning_recommendations AS dtr
+JOIN sys.query_store_plan AS rp
+     ON rp.query_id = dtr.query_id
+    AND rp.plan_id = dtr.regressedPlanId
+JOIN sys.query_store_plan AS sp
+     ON sp.query_id = dtr.query_id
+    AND sp.plan_id = dtr.recommendedPlanId
+JOIN sys.query_store_query AS qsq
+     ON qsq.query_id = rp.query_id
+JOIN sys.query_store_query_text AS qsqt
+     ON qsqt.query_text_id = qsq.query_text_id
+WHERE dtr.estimated_gain > 0      -- 🔥 filtre ajouté
+ORDER BY dtr.estimated_gain DESC; -- 🔥 tri par gain
+
