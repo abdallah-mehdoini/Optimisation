@@ -1,0 +1,291 @@
+USE [DACODAQ]
+GO
+/****** Object:  StoredProcedure [dbo].[ADM_AUTO_KILL]    Script Date: 16/04/2026 10:34:08 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+/*
+Kill des locks loggés dans CRW_LOG_WHOISACTIVE
+2014-08-15	JS	Création
+2014-09-08	JS	Prise en compte des locks > 10 min
+2015-11-05	JS	Mise en place du paramètre @IND_REPLICA pour killer les locks sur la réplication (mode spécial car pas d'insert sur la réplication)
+2015-11-30	JS	Prise en compte du kill automatique des process via	la table de paramétrage ADMIN_LOCK_PARAM
+2026-04-13	AM Désactivation limite autokill sur CPU et READS + Modif parametre max run query à 9000 secondes + Limitation sur seul user IUSR_BITEAM
+*/
+ALTER PROCEDURE [dbo].[ADM_AUTO_KILL] --@IND_REPLICA INT = NULL
+AS
+BEGIN
+	DECLARE
+	@NUM_LOG INT,
+	@SESSION_ID INT,
+	@TOTALTIME INT,
+	@LOGINNAME VARCHAR(35),
+	@SQL_TEXT VARCHAR(MAX),
+	@SQL_COMMAND VARCHAR(100),
+	@RECIPIENTS VARCHAR(200),
+	@SUBJECT VARCHAR(200),
+	@BODY VARCHAR(MAX),
+	@LISTE_PID_LOCK VARCHAR(600),
+	@LIGNE_PID_LOCK VARCHAR(100),
+	@DB_NAME VARCHAR(100),
+	@KILL_DELAY INT,
+	@EMAIL	VARCHAR(250),
+	
+	@cmd VARCHAR(MAX)
+
+
+
+	--SET @EMAIL = 'thomas.albisson@bollore.com'
+
+	--------------------------------------------------------------
+	----- INSERT DU CONTENU DE SP_WHOISACTIVE DANS UNE TABLE -----
+	--------------------------------------------------------------
+	--DROP TABLE #_TMP_WHOISACTIVE
+	CREATE TABLE #_TMP_WHOISACTIVE (
+		[COLLECTION_TIME] DATETIME
+		,[START_TIME] DATETIME
+		,[DD HH:MM:SS.MSS] VARCHAR(15) NULL
+		,[SESSION_ID] SMALLINT NOT NULL
+		,[SQL_TEXT] XML NULL
+		,[SQL_COMMAND] XML NULL
+		,[LOGIN_NAME] NVARCHAR(128) NOT NULL
+		,[WAIT_INFO] NVARCHAR(4000) NULL
+		,[CPU] VARCHAR(30) NULL
+		,[BLOCKING_SESSION_ID] INT NULL
+		,[READS] VARCHAR(30) NULL
+	)
+
+	EXEC master.dbo.SP_WHOISACTIVE @DESTINATION_TABLE = '#_TMP_WHOISACTIVE'
+						, @OUTPUT_COLUMN_LIST ='[COLLECTION_TIME][START_TIME][DD HH:MM:SS.MSS][SESSION_ID][SQL_TEXT][SQL_COMMAND][LOGIN_NAME][WAIT_INFO][CPU][BLOCKING_SESSION_ID][READS]'
+						, @get_outer_command = 1
+	
+	--SELECT * FROM #_TMP_WHOISACTIVE
+	
+	/*BEGIN
+		---------------------------------------------------
+		-- CURSEUR POUR KILLER LES PROCESS "WEB" BLOQUES --
+		---------------------------------------------------
+
+		DECLARE CURS_MON_PROCESS CURSOR FORWARD_ONLY FOR
+			SELECT NUM_LOG, PID, DATEDIFF(MINUTE, GMT_EXEC_PID, DAT_SYS), LOGIN_NAME, SUBSTRING(CAST(SQL_TEXT AS VARCHAR(MAX)),0, 100), SUBSTRING(CAST(SQL_COMMAND AS VARCHAR(MAX)),0, 100)
+			   FROM CRW_LOG_WHOISACTIVE
+			   WHERE IND_DEL = 0  AND LOG_TYPE = 'WAIT'
+
+		OPEN CURS_MON_PROCESS
+		FETCH NEXT FROM CURS_MON_PROCESS INTO @NUM_LOG, @SESSION_ID, @TOTALTIME, @LOGINNAME, @SQL_TEXT, @SQL_COMMAND
+		WHILE (@@FETCH_STATUS <> -1)
+		BEGIN
+			  IF (@@FETCH_STATUS <> -2)
+			  BEGIN
+							SET @DB_NAME = DB_NAME (DB_ID())
+							SET @SUBJECT = '[LINK_MON][!]['+@DB_NAME+'] Process ' + REPLACE(@LOGINNAME, 'IUSR_', '') + ' en timeout'
+							SET @BODY = 'Le process ' + REPLACE(@LOGINNAME, 'IUSR_', '') + ' numéro ' + CAST(@SESSION_ID AS VARCHAR(4)) + ' est bloqué depuis ' + CAST(@TOTALTIME AS VARCHAR(4)) + ' minutes. <br /><br />'
+							SET @BODY = @BODY + 'Un kill automatique de ce process va être effectué.<br /><br />'
+							SET @BODY = @BODY + '<b>Procédure concernée :</b> <br /><br />' + ISNULL(REPLACE(@SQL_COMMAND, '<?query --', ''), 'SQL_Command inconnue') + '<br /><br />'
+							SET @BODY = @BODY + '<b>Code concerné :</b> <br /><br />' + ISNULL(REPLACE(REPLACE(@SQL_TEXT, '--?>',''), '<?query --', ''), 'SQL_Text inconnue') + '<br /><br />'
+							SET @RECIPIENTS = @EMAIL
+
+							EXEC msdb.dbo.sp_send_dbmail @profile_name='ARIANE SQL SMTP'
+								   , @recipients= @RECIPIENTS
+								   , @copy_recipients = ''
+								   , @subject = @SUBJECT
+								   , @body = @BODY
+								   , @body_format = 'HTML'
+								   , @importance = 'HIGH';
+							
+							EXEC ('KILL ' + @SESSION_ID)
+			   	
+							UPDATE CRW 
+							SET CRW.IND_DEL = 1, KILL_MODE = 'AUTO' , DATE_FIN = GETDATE()
+							FROM CRW_LOG_WHOISACTIVE CRW
+							WHERE CRW.IND_DEL = 0 AND CRW.PID = @SESSION_ID
+
+			  END
+			  FETCH NEXT FROM CURS_MON_PROCESS INTO @NUM_LOG,  @SESSION_ID, @TOTALTIME, @LOGINNAME, @SQL_TEXT, @SQL_COMMAND
+		END
+		DEALLOCATE CURS_MON_PROCESS
+
+
+		----------------------------------------------
+		-- CURSEUR POUR KILLER LES PROCESS LOCKANTS --
+		----------------------------------------------
+
+		DECLARE CURS_MON_PROCESS CURSOR FORWARD_ONLY FOR
+				SELECT NUM_LOG, PID, DATEDIFF(MINUTE, GMT_EXEC_PID, DAT_SYS), LOGIN_NAME, SUBSTRING(CAST(SQL_TEXT AS VARCHAR(MAX)),0, 100), SUBSTRING(CAST(SQL_COMMAND AS VARCHAR(MAX)),0, 100)
+			   FROM CRW_LOG_WHOISACTIVE
+			   WHERE IND_DEL = 0 AND LOG_TYPE = 'LOCK'
+		OPEN CURS_MON_PROCESS
+		FETCH NEXT FROM CURS_MON_PROCESS INTO @NUM_LOG, @SESSION_ID, @TOTALTIME, @LOGINNAME, @SQL_TEXT, @SQL_COMMAND
+		WHILE (@@FETCH_STATUS <> -1)
+		BEGIN
+			  IF (@@FETCH_STATUS <> -2)
+			  BEGIN
+
+					DECLARE @LockedProcess TABLE
+					(
+						LISTE VARCHAR(MAX)
+					);
+
+					----------------------------------------------------------
+					-- RESCENCEMENT DES PID BLOQUES PAR LE TOP LOCK COURANT --
+					----------------------------------------------------------
+				
+					;WITH RECURS_PID AS
+					(
+						SELECT SESSION_ID, CAST(SQL_COMMAND AS VARCHAR(MAX)) AS SQL_COMMAND, CAST(LOGIN_NAME AS VARCHAR(MAX)) AS LOGIN_NAME
+						FROM #_TMP_WHOISACTIVE
+						WHERE BLOCKING_SESSION_ID = @SESSION_ID
+					
+						UNION ALL
+					
+						SELECT MON.SESSION_ID, CAST(MON.SQL_COMMAND AS VARCHAR(MAX)) AS SQL_COMMAND, CAST(MON.LOGIN_NAME AS VARCHAR(MAX)) AS LOGIN_NAME
+						FROM #_TMP_WHOISACTIVE MON
+						INNER JOIN RECURS_PID REC ON REC.SESSION_ID = MON.BLOCKING_SESSION_ID
+
+					)
+
+					INSERT INTO @LockedProcess(LISTE)
+					SELECT ' -  Process ' + REPLACE(LOGIN_NAME, 'IUSR_', '') + ' (' + CAST(SESSION_ID AS VARCHAR(5)) + ') : ' + SQL_COMMAND + '<br />' FROM RECURS_PID
+				
+
+					DECLARE CURS_LISTE_PID CURSOR FORWARD_ONLY FOR
+						SELECT *
+						FROM @LockedProcess
+					OPEN CURS_LISTE_PID
+					FETCH NEXT FROM CURS_LISTE_PID INTO @LIGNE_PID_LOCK
+					WHILE (@@FETCH_STATUS <> -1)
+						BEGIN
+							IF (@@FETCH_STATUS <> -2)
+								BEGIN
+										SET @LISTE_PID_LOCK = ISNULL(@LISTE_PID_LOCK, '') + @LIGNE_PID_LOCK + '<br />'
+								END
+							FETCH NEXT FROM CURS_LISTE_PID INTO @LIGNE_PID_LOCK
+						END
+					DEALLOCATE CURS_LISTE_PID
+
+					SELECT @LISTE_PID_LOCK
+					SET @DB_NAME = DB_NAME (DB_ID())
+					SET @SUBJECT = '[LINK_MON][!][' + @DB_NAME + '] Process ' + REPLACE(@LOGINNAME, 'IUSR_', '') + ' lockant'
+					SET @BODY = 'Le process ' + REPLACE(@LOGINNAME, 'IUSR_', '') + ' numéro ' + CAST(@SESSION_ID AS VARCHAR(4)) + ' lock d''autres process depuis ' + CAST(@TOTALTIME AS VARCHAR(4)) + ' minutes. <br /><br />'			
+					SET @BODY = @BODY + '<b>Liste des process bloqués par ce lock : </b><br /><br />' + REPLACE(REPLACE(@LISTE_PID_LOCK, '--?>',''), '<?query --', '') + '<br /><br />'	
+					SET @BODY = @BODY + '<b>Procédure concernée :</b> <br /><br />' + ISNULL(REPLACE(@SQL_COMMAND, '<?query --', ''), 'SQL_Command inconnue') + '<br /><br />'
+					SET @BODY = @BODY + '<b>Code concerné :</b> <br /><br />' + ISNULL(REPLACE(REPLACE(@SQL_TEXT, '--?>',''), '<?query --', ''), 'SQL_Text inconnue') + '<br /><br />'
+					SET @RECIPIENTS = @EMAIL
+
+					EXEC msdb.dbo.sp_send_dbmail @profile_name='ARIANE SQL SMTP'
+						   , @recipients= @RECIPIENTS
+						   , @copy_recipients = ''
+						   , @subject = @SUBJECT
+						   , @body = @BODY
+						   , @body_format = 'HTML'
+						   , @importance = 'HIGH';
+
+					SET @KILL_DELAY = (SELECT DELAY FROM ADMIN_LOCK_PARAM ALP WHERE @SQL_COMMAND LIKE '%' + ALP.OBJ_NAME + '%' AND ALP.IND_AUTOKILL = 1 AND DAY LIKE DATEPART(weekday, GETDATE()))
+					
+					IF @KILL_DELAY IS NOT NULL AND @TOTALTIME > @KILL_DELAY
+					BEGIN
+						EXEC ('KILL ' + @SESSION_ID)
+			   		END
+
+					--UPDATE CRW 
+					--SET CRW.IND_DEL = 1, KILL_MODE = 'AUTO' , DATE_FIN = GETDATE()
+					--FROM CRW_LOG_WHOISACTIVE CRW
+					--WHERE CRW.IND_DEL = 0 AND CRW.PID = @SESSION_ID
+
+			  END
+			  FETCH NEXT FROM CURS_MON_PROCESS INTO @NUM_LOG,  @SESSION_ID, @TOTALTIME, @LOGINNAME, @SQL_TEXT, @SQL_COMMAND
+		END
+		DEALLOCATE CURS_MON_PROCESS
+	END
+	*/
+	--IF @IND_REPLICA = 1
+	BEGIN
+		---------------------------------------------------
+		-- CURSEUR POUR KILLER LES PROCESS "WEB" BLOQUES --
+		---------------------------------------------------
+	
+
+		DECLARE CURS_MON_PROCESS CURSOR FORWARD_ONLY FOR
+		
+		
+			SELECT SESSION_ID, DATEDIFF(SECOND, START_TIME, GETDATE()), LOGIN_NAME, CAST(SQL_TEXT AS VARCHAR(MAX)), SUBSTRING(CAST(SQL_COMMAND AS VARCHAR(MAX)),0, 100)
+			FROM #_TMP_WHOISACTIVE
+			WHERE LOGIN_NAME = 'IUSR_BITEAM'
+			AND (
+				(DATEDIFF(SECOND, START_TIME, GETDATE()) >=  9000 )
+			--	OR	(CPU > '5000000' OR READS > '1000000') )
+				)
+				
+		
+
+		OPEN CURS_MON_PROCESS
+		FETCH NEXT FROM CURS_MON_PROCESS INTO @SESSION_ID, @TOTALTIME, @LOGINNAME, @SQL_TEXT, @SQL_COMMAND
+		WHILE (@@FETCH_STATUS <> -1)
+		BEGIN
+			  IF (@@FETCH_STATUS <> -2)
+			  BEGIN
+				SET @SUBJECT = '[02PZ][!][Requête > 8heure] Process ' + REPLACE(@LOGINNAME, 'IUSR_', '') + ' en timeout'
+				SET @BODY = 'La requête ' + REPLACE(@LOGINNAME, 'IUSR_', '') + ' numéro ' + CAST(@SESSION_ID AS VARCHAR(4)) + ' tourne depuis ' + CONVERT(VARCHAR,@TOTALTIME) + ' secondes. <br /><br />'
+				SET @BODY = @BODY + 'Un kill automatique de cette requête va être effectué.<br /><br />'
+				--SET @BODY = @BODY + '<b>Procédure concernée :</b> <br /><br />' + ISNULL(REPLACE(@SQL_COMMAND, '<?query --', ''), 'SQL_Command inconnue') + '<br /><br />'
+				SET @BODY = @BODY + '<b>Code concerné :</b> <br /><br />' + ISNULL(REPLACE(REPLACE(@SQL_TEXT, '--?>',''), '<?query --', ''), 'SQL_Text inconnue') + '<br /><br />'
+				SET @BODY = @BODY + '<b>La requête a été historisée dans la table DACODAQ.[dbo].[ADM_AUTO_KILL_LOG]</b> <br /><br />' 
+				SET @RECIPIENTS = @EMAIL
+
+				--EXEC msdb.dbo.sp_send_dbmail @profile_name='begfrCRBapp02PZ BDD SMTP'
+				--	   , @recipients= @RECIPIENTS
+				--	   , @copy_recipients = ''
+				--	   , @subject = @SUBJECT
+				--	   , @body = @BODY
+				--	   , @body_format = 'HTML'
+				--	   , @importance = 'HIGH';
+				
+				EXEC ('KILL ' + @SESSION_ID)
+			   	
+			  END
+			  FETCH NEXT FROM CURS_MON_PROCESS INTO @SESSION_ID, @TOTALTIME, @LOGINNAME, @SQL_TEXT, @SQL_COMMAND
+		END
+		DEALLOCATE CURS_MON_PROCESS
+
+		INSERT INTO [DACODAQ].[dbo].[ADM_AUTO_KILL_LOG]
+			(
+			[COLLECTION_TIME],
+			[START_TIME],
+			[DD HH:MM:SS.MSS],
+			[SESSION_ID],
+			[SQL_TEXT],
+			[SQL_COMMAND],
+			[LOGIN_NAME],
+			[WAIT_INFO],
+			[CPU],
+			[READS],
+			[BLOCKING_SESSION_ID],
+			[KILL_MODE],
+			[DATE_FIN]
+			)
+		SELECT [COLLECTION_TIME],
+				[START_TIME],
+				[DD HH:MM:SS.MSS],
+				SESSION_ID,
+				ISNULL(REPLACE(REPLACE(CAST(SQL_TEXT AS VARCHAR(MAX)), '--?>',''), '<?query --', ''), 'SQL_Text inconnue'),
+				CAST(SQL_COMMAND AS NVARCHAR(MAX)),
+				LOGIN_NAME,
+				[WAIT_INFO],
+				RTRIM([CPU]),
+				RTRIM([READS]),
+				NULL                     AS [BLOCKING_SESSION_ID],
+				CASE 
+					WHEN DATEDIFF(SECOND, START_TIME, GETDATE()) >= 9000 THEN 'CRITICAL'
+					ELSE 'WARNING' END  AS [KILL_MODE],
+				CAST(GETDATE() AS DATE)  AS [DATE_FIN]
+		FROM   #_TMP_WHOISACTIVE
+		WHERE (
+				(DATEDIFF(SECOND, START_TIME, GETDATE()) >= 9000 ) 
+				--OR	(CPU > '1000000' OR READS > '1000000') )
+				)
+				AND LOGIN_NAME IN ('IUSR_BITEAM')
+
+	END
+END
+
