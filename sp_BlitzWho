@@ -1,2 +1,7 @@
 EXEC sp_BlitzWho 
+    @ExpertMode = 1,
+    @GetLiveQueryPlan = 1,
+    @ShowActualParameters = 1;
+
+EXEC sp_BlitzWho 
     @ExpertMode = 1
